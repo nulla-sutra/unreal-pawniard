@@ -6,6 +6,7 @@
 #include "Components/ArrowComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "DefaultMovementSet/NavMoverComponent.h"
+#include "Engine/CollisionProfile.h"
 #include "Navigation/PathFollowingComponent.h"
 
 
