@@ -7,6 +7,7 @@
 #include "Components/CapsuleComponent.h"
 #include "DefaultMovementSet/NavMoverComponent.h"
 #include "Engine/CollisionProfile.h"
+#include "GameFramework/Controller.h"
 #include "Navigation/PathFollowingComponent.h"
 
 
@@ -59,7 +60,8 @@ APCharacter::APCharacter()
 #endif // WITH_EDITORONLY_DATA
 
     // Mover
-    MoverComponent = CreateDefaultSubobject<UMoverComponent>(TEXT("MoverComponent"));
+    // Keep the subobject name so existing Blueprint component overrides still resolve.
+    MoverComponent = CreateDefaultSubobject<UCharacterMoverComponent>(TEXT("MoverComponent"));
     ensure(MoverComponent);
 
     //
@@ -70,8 +72,8 @@ APCharacter::APCharacter()
     // NavMover
     NavMoverComponent = CreateDefaultSubobject<UNavMoverComponent>(TEXT("NavMoverComponent"));
     NavMoverComponent->UpdateNavAgent(*CollisionCapsule);
-    NavMoverComponent->SetPathFollowingAgent(PathFollowingComponent);
     PathFollowingComponent = CreateDefaultSubobject<UPathFollowingComponent>(TEXT("PathFollowingComponent"));
+    NavMoverComponent->SetPathFollowingAgent(PathFollowingComponent);
 }
 
 // Called when the game starts or when spawned
@@ -79,6 +81,13 @@ void APCharacter::BeginPlay()
 {
     Super::BeginPlay();
     PathFollowingComponent->SetNavMovementInterface(NavMoverComponent);
+    if (const auto OwningController = GetController())
+    {
+        if (const auto ControllerPathFollower = OwningController->FindComponentByClass<UPathFollowingComponent>())
+        {
+            ControllerPathFollower->SetNavMovementInterface(NavMoverComponent);
+        }
+    }
 }
 
 FVector APCharacter::GetNavAgentLocation() const
@@ -88,6 +97,11 @@ FVector APCharacter::GetNavAgentLocation() const
 
 IPathFollowingAgentInterface* APCharacter::GetPathFollowingAgent() const
 {
+    // SimpleMove uses a controller-owned path follower; expose whichever agent is driving NavMover.
+    if (auto* ActiveAgent = NavMoverComponent->GetPathFollowingAgent())
+    {
+        return ActiveAgent;
+    }
     return PathFollowingComponent;
 }
 

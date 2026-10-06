@@ -28,6 +28,8 @@ public class Pawniard : ModuleRules
 			new[]
 			{
 				"Core",
+				"CoreUObject",
+				"Engine",
 				// ... add other public dependencies that you statically link with here ...
 				"Mover",
 				"NavigationSystem",
@@ -41,8 +43,6 @@ public class Pawniard : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new[]
 			{
-				"CoreUObject",
-				"Engine",
 				"Slate",
 				"SlateCore",
 				// ... add private dependencies that you statically link with here ...	

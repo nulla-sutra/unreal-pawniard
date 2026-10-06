@@ -3,7 +3,7 @@
     "Version": 1,
     "VersionName": "1.0",
     "FriendlyName": "Pawniard",
-    "Description": "",
+    "Description": "Character Mover pawns and top-down movement controls for Mover and Character Movement Component.",
     "Category": "Other",
     "CreatedBy": "tarnishablec",
     "CreatedByURL": "https://github.com/tarnishablec",
@@ -23,17 +23,14 @@
     "Plugins": [
         {
             "Name": "Mover",
-            "Optional": true,
             "Enabled": true
         },
         {
             "Name": "Wynaut",
-            "Optional": true,
             "Enabled": true
         },
         {
             "Name": "EnhancedInput",
-            "Optional": true,
             "Enabled": true
         }
     ]
