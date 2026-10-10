@@ -1,6 +1,7 @@
 ﻿// Copyright Epic Games, Inc. All Rights Reserved.
 
 using UnrealBuildTool;
+using System.IO;
 
 public class Pawniard : ModuleRules
 {
@@ -11,7 +12,7 @@ public class Pawniard : ModuleRules
 		PublicIncludePaths.AddRange(
 			new string[]
 			{
-				// ... add public include paths required here ...
+				Path.Combine(ModuleDirectory, "Animation")
 			}
 		);
 
@@ -36,7 +37,10 @@ public class Pawniard : ModuleRules
 				"AIModule",
 				"Wynaut",
 				"EnhancedInput",
-				"GameplayTags"
+				"GameplayTags",
+				"AnimGraphRuntime",
+				"AnimationWarpingRuntime",
+				"AnimationCore"
 			}
 		);
 
@@ -45,7 +49,7 @@ public class Pawniard : ModuleRules
 			new[]
 			{
 				"Slate",
-				"SlateCore",
+				"SlateCore", "AnimationWarpingRuntime",
 				// ... add private dependencies that you statically link with here ...	
 			}
 		);

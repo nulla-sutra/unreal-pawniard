@@ -18,6 +18,11 @@
             "Name": "Pawniard",
             "Type": "Runtime",
             "LoadingPhase": "Default"
+        },
+        {
+            "Name": "PawniardAnimGraph",
+            "Type": "UncookedOnly",
+            "LoadingPhase": "PreDefault"
         }
     ],
     "Plugins": [
@@ -31,6 +36,10 @@
         },
         {
             "Name": "EnhancedInput",
+            "Enabled": true
+        },
+        {
+            "Name": "AnimationWarping",
             "Enabled": true
         }
     ]
