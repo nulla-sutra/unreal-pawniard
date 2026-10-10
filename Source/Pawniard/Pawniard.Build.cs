@@ -31,6 +31,7 @@ public class Pawniard : ModuleRules
 				"Core",
 				"CoreUObject",
 				"Engine",
+				"PhysicsCore",
 				// ... add other public dependencies that you statically link with here ...
 				"Mover",
 				"NavigationSystem",

@@ -2,7 +2,9 @@
 
 #include "AnimNode_PawniardFootPlacement.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimTrace.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/ShapeComponent.h"
 #include "GameFramework/Actor.h"
 #include "AnimationRuntime.h"
 #include "Animation/AnimInstanceProxy.h"
@@ -48,7 +50,7 @@ namespace UE::Anim::PawniardFootPlacement
 
     static FGroundSample FindPlantTraceImpact(const FEvaluationContext& Context,
         const FFootPlacementTraceSettings& Settings, const FVector& PointWS,
-        bool bComplex, const FGroundSample* SupportSnapshot)
+        bool bComplex, bool bUseSphereTrace, const FGroundSample* SupportSnapshot)
     {
         FGroundSample Sample;
         Sample.QueryPointWS = PointWS;
@@ -63,14 +65,21 @@ namespace UE::Anim::PawniardFootPlacement
         const auto Channel = UEngineTypes::ConvertToCollisionChannel(
             bComplex ? Settings.ComplexTraceChannel : Settings.SimpleTraceChannel);
         const auto Scale = Context.WorldUnitsPerComponentUnit;
-        const auto Shape = FCollisionShape::MakeSphere(FMath::Max(0.01f, Settings.SweepRadius * Scale));
+        const auto StartWS = PointWS + Context.ApproachDirWS * Settings.StartOffset * Scale;
+        const auto EndWS = PointWS + Context.ApproachDirWS * Settings.EndOffset * Scale;
         FHitResult Hit;
-        // Match the native node: this synchronous sweep consumes the current evaluated foot target.
-        Sample.bHit = World->SweepSingleByChannel(Hit,
-            PointWS + Context.ApproachDirWS * Settings.StartOffset * Scale,
-            PointWS + Context.ApproachDirWS * Settings.EndOffset * Scale,
-            FQuat::Identity, Channel, Shape, QueryParams)
-            && Hit.bBlockingHit && !Hit.bStartPenetrating
+        auto bHit = false;
+        // Match native timing: query the current evaluated target synchronously.
+        if (bUseSphereTrace)
+        {
+            const auto Shape = FCollisionShape::MakeSphere(FMath::Max(0.01f, Settings.SweepRadius * Scale));
+            bHit = World->SweepSingleByChannel(Hit, StartWS, EndWS, FQuat::Identity, Channel, Shape, QueryParams);
+        }
+        else
+        {
+            bHit = World->LineTraceSingleByChannel(Hit, StartWS, EndWS, Channel, QueryParams);
+        }
+        Sample.bHit = bHit && Hit.bBlockingHit && !Hit.bStartPenetrating
             && FVector::DotProduct(Hit.ImpactNormal.GetSafeNormal(), -Context.ApproachDirWS)
                 >= Context.MinGroundNormalDot;
         if (Sample.bHit)
@@ -92,13 +101,98 @@ namespace UE::Anim::PawniardFootPlacement
 
     static FGroundSample FindPlantPlane(const FEvaluationContext& Context,
         const FFootPlacementTraceSettings& Settings, const FVector& PointWS,
-        bool bPreferSimple, const FGroundSample* SupportSnapshot = nullptr)
+        bool bPreferSimple, const FGroundSample* SupportSnapshot = nullptr, bool bPreferPointContact = true)
     {
-        auto Sample = FindPlantTraceImpact(Context, Settings, PointWS,
-            !bPreferSimple && !Settings.bDisableComplexTrace, SupportSnapshot);
-        if (!Sample.bHit && !Settings.bDisableComplexTrace)
+        const auto bComplexFirst = !bPreferSimple && !Settings.bDisableComplexTrace;
+        const auto TracePreferredCollision = [&](bool bUseSphereTrace)
         {
-            Sample = FindPlantTraceImpact(Context, Settings, PointWS, bPreferSimple, SupportSnapshot);
+            auto Sample = FindPlantTraceImpact(Context, Settings, PointWS,
+                bComplexFirst, bUseSphereTrace, SupportSnapshot);
+            if (!Sample.bHit && !Settings.bDisableComplexTrace)
+            {
+                Sample = FindPlantTraceImpact(Context, Settings, PointWS,
+                    !bComplexFirst, bUseSphereTrace, SupportSnapshot);
+            }
+            return Sample;
+        };
+        if (bPreferPointContact)
+        {
+            // A nearby ledge must not mask valid ground directly beneath the foot.
+            const auto Sample = TracePreferredCollision(false);
+            if (Sample.bHit)
+            {
+                return Sample;
+            }
+        }
+        // Keep sphere sweeps for gaps where neither point trace found valid ground.
+        return TracePreferredCollision(true);
+    }
+
+    static FGroundSample FindBodySupport(const FEvaluationContext& Context, float GroundTolerance)
+    {
+        FGroundSample Sample;
+        const auto& Scene = Context.Scene;
+        const auto* World = Scene.World.Get();
+        if (!World || !Scene.bHasBodyCollision)
+        {
+            return Sample;
+        }
+
+        auto QueryParams = Scene.QueryParams;
+        QueryParams.bTraceComplex = false;
+        const auto BodyLocationWS = Scene.BodyTransformWS.GetLocation();
+        const auto BodyRotation = Scene.BodyTransformWS.GetRotation();
+        const auto UpWS = -Context.ApproachDirWS;
+        const auto& Shape = Scene.BodyCollisionShape;
+        auto SupportExtentAlongUp = 0.0;
+        auto CurvatureAllowance = 0.0;
+        if (Shape.IsCapsule())
+        {
+            const auto Radius = Shape.GetCapsuleRadius();
+            SupportExtentAlongUp = Radius + FMath::Max(0.0f, Shape.GetCapsuleHalfHeight() - Radius)
+                * FMath::Abs(FVector::DotProduct(BodyRotation.GetAxisZ(), UpWS));
+            CurvatureAllowance = Radius;
+        }
+        else if (Shape.IsSphere())
+        {
+            SupportExtentAlongUp = Shape.GetSphereRadius();
+            CurvatureAllowance = SupportExtentAlongUp;
+        }
+        else if (Shape.IsBox())
+        {
+            const auto Extent = Shape.GetBox();
+            SupportExtentAlongUp = FMath::Abs(FVector::DotProduct(BodyRotation.GetAxisX(), UpWS)) * Extent.X
+                + FMath::Abs(FVector::DotProduct(BodyRotation.GetAxisY(), UpWS)) * Extent.Y
+                + FMath::Abs(FVector::DotProduct(BodyRotation.GetAxisZ(), UpWS)) * Extent.Z;
+        }
+        else
+        {
+            return Sample;
+        }
+
+        // A step can raise the body before its rounded end is over the tread.
+        constexpr auto ProbeLift = 2.0f;
+        FHitResult Hit;
+        const auto bHit = World->SweepSingleByChannel(Hit,
+            BodyLocationWS - Context.ApproachDirWS * ProbeLift,
+            BodyLocationWS + Context.ApproachDirWS * (GroundTolerance + CurvatureAllowance),
+            BodyRotation, Scene.BodyCollisionChannel, Shape, QueryParams, Scene.BodyCollisionResponses);
+        const auto ImpactNormalWS = Hit.ImpactNormal.GetSafeNormal();
+        const auto NormalUpDot = FVector::DotProduct(ImpactNormalWS, UpWS);
+        if (!bHit || !Hit.bBlockingHit || Hit.bStartPenetrating || !(NormalUpDot >= Context.MinGroundNormalDot))
+        {
+            return Sample;
+        }
+
+        const auto BodyBaseWS = BodyLocationWS - UpWS * SupportExtentAlongUp;
+        const auto BasePlaneDistance = FVector::DotProduct(BodyBaseWS - Hit.ImpactPoint, ImpactNormalWS) / NormalUpDot;
+        // Preserve close physical support on slopes; floor height also covers rounded-edge step transitions.
+        Sample.bHit = Hit.Distance - ProbeLift <= GroundTolerance + KINDA_SMALL_NUMBER
+            || FMath::Abs(BasePlaneDistance) <= GroundTolerance + KINDA_SMALL_NUMBER;
+        if (Sample.bHit)
+        {
+            Sample.PositionWS = Hit.ImpactPoint;
+            Sample.NormalWS = ImpactNormalWS;
         }
         return Sample;
     }
@@ -732,6 +826,20 @@ void FAnimNode_PawniardFootPlacement::PreUpdate(const UAnimInstance* InAnimInsta
         TArray<AActor*> AttachedActors;
         Owner->GetAttachedActors(AttachedActors, true, true);
         NextScene.QueryParams.AddIgnoredActors(AttachedActors);
+
+        // Shape data and collision responses are UObject state, so capture them on the game thread.
+        if (const auto* Body = Cast<UShapeComponent>(Owner->GetRootComponent());
+            Body && Body->IsQueryCollisionEnabled())
+        {
+            NextScene.BodyCollisionShape = Body->GetCollisionShape();
+            NextScene.BodyTransformWS = Body->GetComponentTransform();
+            NextScene.BodyCollisionChannel = Body->GetCollisionObjectType();
+            NextScene.BodyCollisionResponses = FCollisionResponseParams(Body->GetCollisionResponseToChannels());
+            NextScene.bHasBodyCollision = !NextScene.BodyTransformWS.ContainsNaN()
+                && !NextScene.BodyCollisionShape.IsNearlyZero()
+                && !NextScene.BodyCollisionShape.GetExtent().ContainsNaN()
+                && NextScene.BodyCollisionShape.GetExtent().GetMin() > SMALL_NUMBER;
+        }
     }
 
     // Cache only environment data. Bone positions and ground queries belong to the current evaluation.
@@ -825,11 +933,13 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
     GatherPelvisDataFromInputs(Context);
     const auto ReferenceWS = Context.OwningComponentToWorld.TransformPosition(
         PelvisData.InputPose.IKRootTransformCS.GetLocation());
+    // Reference support may span a ledge; foot contacts resolve their own surfaces separately.
     const auto ReferenceGround = UE::Anim::PawniardFootPlacement::FindPlantPlane(
-        Context, TraceSettings, ReferenceWS, true);
+        Context, TraceSettings, ReferenceWS, true, nullptr, false);
     Context.GroundLocation = ReferenceGround.bHit ? ReferenceGround.PositionWS : ReferenceWS;
     Context.GroundNormal = ReferenceGround.bHit ? ReferenceGround.NormalWS : -Context.ApproachDirWS;
-    const auto GroundTolerance = FMath::Max(0.0f, AutoGroundDistance) * Context.WorldUnitsPerComponentUnit
+    // Support distances are in world centimeters; mesh scale must not shrink the grounding tolerance.
+    const auto GroundTolerance = FMath::Max(0.0f, AutoGroundDistance)
         * (CharacterData.bIsOnGround ? 1.5f : 1.0f);
     Context.bGrounded = ReferenceGround.bHit
         && FMath::Abs(FVector::DotProduct(ReferenceWS - ReferenceGround.PositionWS, -Context.ApproachDirWS))
@@ -845,14 +955,12 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
             const auto Distance = UE::Anim::PawniardFootPlacement::GetDistanceToPlaneAlongDirection(
                 ReferenceWS, FPlane(Context.GroundLocation, Context.GroundNormal), Context.ApproachDirWS);
             Context.bGrounded = FMath::Abs(Distance.Get(BIG_NUMBER))
-                <= FMath::Max(0.0f, AutoGroundDistance) * Context.WorldUnitsPerComponentUnit
-                    * (CharacterData.bIsOnGround ? 1.5f : 1.0f);
+                <= GroundTolerance;
         }
     }
-    if (bOverrideGrounded)
-    {
-        Context.bGrounded = bGrounded;
-    }
+    // The reference may cross a ledge while either foot still supports the character.
+    auto bHasFootSupport = false;
+    auto ClosestSupportDistance = BIG_NUMBER;
     GroundSamples.SetNum(LegsData.Num());
     for (auto Index = 0; Index < LegsData.Num(); ++Index)
     {
@@ -872,6 +980,79 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
         // Establish contact from this pose before deciding whether the leg may lock.
         GroundSamples[Index] = UE::Anim::PawniardFootPlacement::FindPlantPlane(
             Context, TraceSettings, QueryPointWS, false, &Support);
+
+        if (Context.bGrounded || bOverrideGrounded || Leg.InputPose.DisableLeg >= 1.0f)
+        {
+            continue;
+        }
+
+        // Locked IK targets can remain on the ground after takeoff; only the current FK pose proves support.
+        const auto FootFKPointWS = Context.OwningComponentToWorld.TransformPosition(
+            Leg.InputPose.FootFKTransformCS.GetLocation());
+        const auto BallFKPointWS = Context.OwningComponentToWorld.TransformPosition(
+            (Leg.InputPose.FootToBall * Leg.InputPose.FootFKTransformCS).GetLocation());
+        auto SupportLocationWS = Context.GroundLocation;
+        auto SupportNormalWS = Context.GroundNormal;
+        if (!Context.bGroundPlaneOverride)
+        {
+            auto SupportSample = GroundSamples[Index];
+            if (!SupportSample.QueryPointWS.Equals(FootFKPointWS, KINDA_SMALL_NUMBER))
+            {
+                SupportSample = UE::Anim::PawniardFootPlacement::FindPlantPlane(
+                    Context, TraceSettings, FootFKPointWS, false, &Support);
+            }
+            if (!SupportSample.bHit)
+            {
+                continue;
+            }
+            SupportLocationWS = SupportSample.PositionWS;
+            SupportNormalWS = SupportSample.NormalWS;
+        }
+
+        const auto SupportPlaneWS = FPlane(SupportLocationWS, SupportNormalWS);
+        const auto FootDistance = UE::Anim::PawniardFootPlacement::GetDistanceToPlaneAlongDirection(
+            FootFKPointWS, SupportPlaneWS, Context.ApproachDirWS);
+        const auto BallDistance = UE::Anim::PawniardFootPlacement::GetDistanceToPlaneAlongDirection(
+            BallFKPointWS, SupportPlaneWS, Context.ApproachDirWS);
+        const auto SupportDistance = FMath::Min(FMath::Abs(FootDistance.Get(BIG_NUMBER)),
+            FMath::Abs(BallDistance.Get(BIG_NUMBER)));
+        if (SupportDistance <= GroundTolerance && SupportDistance < ClosestSupportDistance)
+        {
+            bHasFootSupport = true;
+            ClosestSupportDistance = SupportDistance;
+            if (!Context.bGroundPlaneOverride)
+            {
+                Context.GroundLocation = SupportLocationWS;
+                Context.GroundNormal = SupportNormalWS;
+            }
+        }
+    }
+    Context.bGrounded |= bHasFootSupport;
+    if (!Context.bGrounded && !bOverrideGrounded && !Context.bGroundPlaneOverride && TraceSettings.bEnabled)
+    {
+        // The body can still be supported by a ledge while both FK feet await IK adjustment.
+        const auto BodySupport = UE::Anim::PawniardFootPlacement::FindBodySupport(Context, GroundTolerance);
+        if (BodySupport.bHit)
+        {
+            Context.bGrounded = true;
+            Context.GroundLocation = BodySupport.PositionWS;
+            Context.GroundNormal = BodySupport.NormalWS;
+        }
+    }
+    TRACE_ANIM_NODE_VALUE(Output, TEXT("AutoGroundToleranceWS"), GroundTolerance);
+    TRACE_ANIM_NODE_VALUE(Output, TEXT("AutomaticGrounded"), Context.bGrounded);
+    TRACE_ANIM_NODE_VALUE(Output, TEXT("OverrideGrounded"), bOverrideGrounded);
+    if (bOverrideGrounded)
+    {
+        Context.bGrounded = bGrounded;
+    }
+    if (!Context.bGrounded)
+    {
+        for (auto& Leg : LegsData)
+        {
+            Leg.InputPose.LockAlpha = 0.0f;
+            Leg.InputPose.AlignmentAlpha = 0.0f;
+        }
     }
 
     PlantRuntimeSettings.UnplantRadiusSqrd = FMath::Square(PlantSettings.UnplantRadius * Context.WorldUnitsPerComponentUnit);
@@ -1057,11 +1238,6 @@ void FAnimNode_PawniardFootPlacement::GatherLegDataFromInputs(
     Input.LockAlpha = FMath::Clamp(1.0f - Context.CSPContext.Curve.Get(LegData.DisableLockCurveName), 0.0f, 1.0f);
     Input.DistanceToPlant = CalcTargetPlantPlaneDistance(Context, Input);
     Input.AlignmentAlpha = GetAlignmentAlpha(Context, Input);
-    if (!Context.bGrounded)
-    {
-        Input.LockAlpha = 0.0f;
-        Input.AlignmentAlpha = 0.0f;
-    }
 }
 
 void FAnimNode_PawniardFootPlacement::CalculateFootMidpoint(const UE::Anim::PawniardFootPlacement::FEvaluationContext& Context, TConstArrayView<UE::Anim::FootPlacement::FLegRuntimeData> InLegsData, FVector& OutMidpoint) const
@@ -1158,6 +1334,16 @@ void FAnimNode_PawniardFootPlacement::ProcessComponentState(const UE::Anim::Pawn
             (ComponentLocationWS - LastComponentLocationWS);
         CharacterData.ComponentMoveDeltaWS += ComponentMoveOffsetWS;
     }
+
+    TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("Grounded"), CharacterData.bIsOnGround);
+    TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("WasGrounded"), bWasOnGround);
+    TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("CompensationEnabled"),
+        bOnGround && PelvisSettings.ActorMovementCompensationMode != EActorMovementCompensationMode::ComponentSpace);
+    TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("ComponentDeltaUpWS"),
+        static_cast<float>(FVector::DotProduct(ComponentLocationWS - LastComponentLocationWS, -Context.ApproachDirWS)));
+    TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("CompensationUpWS"),
+        static_cast<float>(FVector::DotProduct(
+            CharacterData.ComponentMoveDeltaWS - (ComponentLocationWS - LastComponentLocationWS), -Context.ApproachDirWS)));
 }
 
 void FAnimNode_PawniardFootPlacement::ProcessFootAlignment(

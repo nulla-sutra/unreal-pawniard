@@ -5,6 +5,7 @@
 
 #include "BoneControllers/AnimNode_FootPlacement.h"
 #include "CollisionQueryParams.h"
+#include "CollisionShape.h"
 #include "AnimNode_PawniardFootPlacement.generated.h"
 
 class UPrimitiveComponent;
@@ -33,6 +34,11 @@ namespace UE::Anim::PawniardFootPlacement
         bool bCanEvaluate = false;
         TWeakObjectPtr<UWorld> World;
         FCollisionQueryParams QueryParams;
+        bool bHasBodyCollision = false;
+        FCollisionShape BodyCollisionShape;
+        FTransform BodyTransformWS = FTransform::Identity;
+        ECollisionChannel BodyCollisionChannel = ECC_Pawn;
+        FCollisionResponseParams BodyCollisionResponses;
         float TeleportDistanceThreshold = 0.0f;
         TArray<FGroundSample> Supports;
     };
