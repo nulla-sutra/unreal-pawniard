@@ -60,7 +60,6 @@ APCharacter::APCharacter()
 #endif // WITH_EDITORONLY_DATA
 
     // Mover
-    // Keep the subobject name so existing Blueprint component overrides still resolve.
     MoverComponent = CreateDefaultSubobject<UCharacterMoverComponent>(TEXT("MoverComponent"));
     ensure(MoverComponent);
 

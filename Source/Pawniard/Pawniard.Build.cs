@@ -35,7 +35,8 @@ public class Pawniard : ModuleRules
 				"NavigationSystem",
 				"AIModule",
 				"Wynaut",
-				"EnhancedInput"
+				"EnhancedInput",
+				"GameplayTags"
 			}
 		);
 
