@@ -41,7 +41,8 @@ public class Pawniard : ModuleRules
 				"GameplayTags",
 				"AnimGraphRuntime",
 				"AnimationWarpingRuntime",
-				"AnimationCore"
+				"AnimationCore",
+				"PoseSearch"
 			}
 		);
 
@@ -49,6 +50,7 @@ public class Pawniard : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new[]
 			{
+				"Chooser",
 				"Slate",
 				"SlateCore", "AnimationWarpingRuntime",
 				// ... add private dependencies that you statically link with here ...	

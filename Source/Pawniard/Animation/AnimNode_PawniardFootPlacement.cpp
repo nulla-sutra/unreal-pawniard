@@ -2,7 +2,6 @@
 
 #include "AnimNode_PawniardFootPlacement.h"
 #include "Animation/AnimInstance.h"
-#include "Animation/AnimTrace.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/ShapeComponent.h"
 #include "GameFramework/Actor.h"
@@ -11,16 +10,40 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 
+// Strip diagnostic storage and sampling work as well as output from Test and Shipping builds.
+#define PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS (UE_BUILD_DEBUG || UE_BUILD_DEVELOPMENT)
+
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+#include "Animation/AnimTrace.h"
+#include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/StringBuilder.h"
+#if ANIM_TRACE_ENABLED
+#include "Trace/Trace.h"
+#endif
+#endif
+
 #include UE_INLINE_GENERATED_CPP_BY_NAME(AnimNode_PawniardFootPlacement)
 
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
 DECLARE_CYCLE_STAT(TEXT("Foot Placement Eval"), STAT_PawniardFootPlacement_Eval, STATGROUP_Anim);
+DEFINE_LOG_CATEGORY_STATIC(LogPawniardFootPlacementDiagnostics, Log, All);
+#endif
 
 namespace UE::Anim::PawniardFootPlacement
 {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    static TAutoConsoleVariable CVarFootPlacementDiagnostics(
+        TEXT("pawniard.FootPlacement.Diagnostics"), 0,
+        TEXT("Log foot contacts, pelvis constraints and interpolation each evaluation. 0: off, 1: on. "
+             "Rewind Diag.* values are recorded independently through the Animation trace channel."),
+        ECVF_Default);
+#endif
+
     struct FEvaluationContext
     {
         FEvaluationContext(FComponentSpacePoseContext& InPose, const FSceneSnapshot& InScene,
-            const FVector& UpWS, float MaxSlopeAngle, float DeltaTime)
+            const FVector& UpWS, const float MaxSlopeAngle, const float DeltaTime)
             : CSPContext(InPose), Scene(InScene), OwningComponentToWorld(InPose.AnimInstanceProxy->GetComponentTransform()),
               UpdateDeltaTime(DeltaTime), ApproachDirWS(UpWS.ContainsNaN() ? -FVector::UpVector : -UpWS.GetSafeNormal())
         {
@@ -32,6 +55,18 @@ namespace UE::Anim::PawniardFootPlacement
             WorldUnitsPerComponentUnit = OwningComponentToWorld.TransformVector(ApproachDirCS).Size();
             GroundNormal = -ApproachDirWS;
             MinGroundNormalDot = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(MaxSlopeAngle, 0.0f, 89.0f)));
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+            bLogDiagnostics = CVarFootPlacementDiagnostics.GetValueOnAnyThread() != 0;
+#if ANIM_TRACE_ENABLED
+            bTraceDiagnostics = UE_TRACE_CHANNELEXPR_IS_ENABLED(AnimationChannel);
+#endif
+            bCaptureDiagnostics = bLogDiagnostics || bTraceDiagnostics;
+            if (bLogDiagnostics)
+            {
+                DiagnosticTime = FPlatformTime::Seconds();
+                DiagnosticValues.Reserve(4096);
+            }
+#endif
         }
 
         FComponentSpacePoseContext& CSPContext;
@@ -46,7 +81,77 @@ namespace UE::Anim::PawniardFootPlacement
         FVector GroundNormal;
         bool bGrounded = false;
         bool bGroundPlaneOverride = false;
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+        bool bCaptureDiagnostics = false;
+        bool bTraceDiagnostics = false;
+        bool bLogDiagnostics = false;
+        double DiagnosticTime = 0.0;
+        mutable FString DiagnosticValues;
+#endif
     };
+
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    static void RecordDiagnostic(const FEvaluationContext& Context, const TCHAR* Name, double Value, int32 LegIndex = INDEX_NONE)
+    {
+        if (!Context.bCaptureDiagnostics)
+        {
+            return;
+        }
+        TStringBuilder<128> Key;
+        if (LegIndex != INDEX_NONE)
+        {
+            Key.Appendf(TEXT("Diag.Leg%d.%s"), LegIndex, Name);
+        }
+        else
+        {
+            Key.Appendf(TEXT("Diag.%s"), Name);
+        }
+        if (Context.bTraceDiagnostics)
+        {
+            TRACE_ANIM_NODE_VALUE(Context.CSPContext, Key.ToString(), static_cast<float>(Value));
+        }
+        if (Context.bLogDiagnostics)
+        {
+            Context.DiagnosticValues.Appendf(TEXT(" %s=%.9g"), Key.ToString(), Value);
+        }
+    }
+
+    static void RecordDiagnostic(const FEvaluationContext& Context, const TCHAR* Name, const FVector& Value, int32 LegIndex = INDEX_NONE)
+    {
+        if (!Context.bCaptureDiagnostics)
+        {
+            return;
+        }
+        TStringBuilder<128> Key;
+        if (LegIndex != INDEX_NONE)
+        {
+            Key.Appendf(TEXT("Diag.Leg%d.%s"), LegIndex, Name);
+        }
+        else
+        {
+            Key.Appendf(TEXT("Diag.%s"), Name);
+        }
+        if (Context.bTraceDiagnostics)
+        {
+            TRACE_ANIM_NODE_VALUE(Context.CSPContext, Key.ToString(), Value);
+        }
+        if (Context.bLogDiagnostics)
+        {
+            Context.DiagnosticValues.Appendf(TEXT(" %s=(%.9g,%.9g,%.9g)"), Key.ToString(), Value.X, Value.Y, Value.Z);
+        }
+    }
+
+    static void FlushDiagnostics(const FEvaluationContext& Context, const void* Node)
+    {
+        if (Context.bLogDiagnostics)
+        {
+            // One row per evaluation keeps worker-thread and server/client records separate without reading live actors.
+            UE_LOG(LogPawniardFootPlacementDiagnostics, Log, TEXT("PFPDiag Time=%.9f Proxy=%p Node=%p%s"),
+                Context.DiagnosticTime, static_cast<const void*>(Context.CSPContext.AnimInstanceProxy), Node,
+                *Context.DiagnosticValues);
+        }
+    }
+#endif
 
     static FGroundSample FindPlantTraceImpact(const FEvaluationContext& Context,
         const FFootPlacementTraceSettings& Settings, const FVector& PointWS,
@@ -460,8 +565,41 @@ void FAnimNode_PawniardFootPlacement::UpdatePlantingPlaneInterpolation(
         ImpactNormalWS = Sample.bHit ? Sample.NormalWS : Context.GroundNormal;
     }
     InOutPlantPlane = FPlane(ImpactPointWS, ImpactNormalWS);
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    const auto RecordPlaneDiagnostics = [&]
+    {
+        if (!Context.bCaptureDiagnostics)
+        {
+            return;
+        }
+        const auto UpWS = -Context.ApproachDirWS;
+        const auto QueryPointWS = FootTransformWS.GetLocation();
+        // Compare both planes at the same XY location; the sweep's impact point may lie off to the side.
+        const auto RawIntersection = PointDirectionPlaneIntersection(QueryPointWS, Context.ApproachDirWS,
+            FPlane(ImpactPointWS, ImpactNormalWS));
+        const auto SmoothedIntersection = PointDirectionPlaneIntersection(QueryPointWS, Context.ApproachDirWS, InOutPlantPlane);
+        RecordDiagnostic(Context, TEXT("TraceHit"), Sample.bHit, LegIndex);
+        RecordDiagnostic(Context, TEXT("UsingFallbackPlane"), !bFoundGround, LegIndex);
+        RecordDiagnostic(Context, TEXT("UsingOverridePlane"), bFoundGround && !Sample.bHit, LegIndex);
+        RecordDiagnostic(Context, TEXT("FloorInterpolationApplied"), InterpolationSettings.bEnableFloorInterpolation && !bIsFirstUpdate, LegIndex);
+        RecordDiagnostic(Context, TEXT("QueryPointWS"), QueryPointWS, LegIndex);
+        RecordDiagnostic(Context, TEXT("ImpactPointWS"), ImpactPointWS, LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundRawUpWS"), RawIntersection.Dot(UpWS), LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundSmoothedUpWS"), SmoothedIntersection.Dot(UpWS), LegIndex);
+        RecordDiagnostic(Context, TEXT("QueryToGroundUpWS"), (QueryPointWS - RawIntersection).Dot(UpWS), LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundRawNormalWS"), ImpactNormalWS, LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundSmoothedNormalWS"), InOutPlantPlane.GetNormal(), LegIndex);
+        RecordDiagnostic(Context, TEXT("FootSpeedCS"), LegInputPose.Speed, LegIndex);
+        RecordDiagnostic(Context, TEXT("AlignmentAlpha"), AlignmentAlpha, LegIndex);
+        RecordDiagnostic(Context, TEXT("LockAlpha"), LegInputPose.LockAlpha, LegIndex);
+        RecordDiagnostic(Context, TEXT("PlantType"), static_cast<int32>(LegsData[LegIndex].Plant.PlantType), LegIndex);
+    };
+#endif
     if (!InterpolationSettings.bEnableFloorInterpolation || bIsFirstUpdate)
     {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+        RecordPlaneDiagnostics();
+#endif
         return;
     }
 
@@ -483,6 +621,14 @@ void FAnimNode_PawniardFootPlacement::UpdatePlantingPlaneInterpolation(
     const auto SpringHeight = UKismetMathLibrary::FloatSpringInterp(AdjustedHeight, CurrentHeight,
         InOutInterpData.GroundHeightSpringState, InterpolationSettings.FloorLinearStiffness,
         InterpolationSettings.FloorLinearDamping, Context.UpdateDeltaTime, 1.0f, 0.0f);
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("GroundPreviousUpWS"), PreviousHeight, LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundAdjustedUpWS"), AdjustedHeight, LegIndex);
+        RecordDiagnostic(Context, TEXT("GroundSpringUpWS"), SpringHeight, LegIndex);
+    }
+#endif
     Intersection += UpWS * (SpringHeight - CurrentHeight);
     if (bFoundGround && TraceSettings.MaxGroundPenetration >= 0.0f)
     {
@@ -499,6 +645,9 @@ void FAnimNode_PawniardFootPlacement::UpdatePlantingPlaneInterpolation(
         InOutInterpData.GroundRotationSpringState, InterpolationSettings.FloorAngularStiffness,
         InterpolationSettings.FloorAngularDamping, Context.UpdateDeltaTime, 1.0f, 0.0f);
     InOutPlantPlane = FPlane(Intersection, NormalSpring.RotateVector(LastPlane.GetNormal()).GetSafeNormal());
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    RecordPlaneDiagnostics();
+#endif
 }
 
 void FAnimNode_PawniardFootPlacement::DeterminePlantType(
@@ -902,7 +1051,10 @@ void FAnimNode_PawniardFootPlacement::UpdateInternal(const FAnimationUpdateConte
 void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
     FComponentSpacePoseContext& Output, TArray<FBoneTransform>& OutBoneTransforms)
 {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    using UE::Anim::PawniardFootPlacement::RecordDiagnostic;
     SCOPE_CYCLE_COUNTER(STAT_PawniardFootPlacement_Eval);
+#endif
     const auto DeltaTime = CachedDeltaTime;
     CachedDeltaTime = 0.0f;
     if (!SceneSnapshot.bCanEvaluate || SceneSnapshot.Supports.Num() != LegsData.Num()
@@ -1039,9 +1191,17 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
             Context.GroundNormal = BodySupport.NormalWS;
         }
     }
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
     TRACE_ANIM_NODE_VALUE(Output, TEXT("AutoGroundToleranceWS"), GroundTolerance);
     TRACE_ANIM_NODE_VALUE(Output, TEXT("AutomaticGrounded"), Context.bGrounded);
     TRACE_ANIM_NODE_VALUE(Output, TEXT("OverrideGrounded"), bOverrideGrounded);
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("AutomaticGrounded"), Context.bGrounded);
+        RecordDiagnostic(Context, TEXT("OverrideGrounded"), bOverrideGrounded);
+        RecordDiagnostic(Context, TEXT("AutoGroundToleranceWS"), GroundTolerance);
+    }
+#endif
     if (bOverrideGrounded)
     {
         Context.bGrounded = bGrounded;
@@ -1069,14 +1229,47 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
     }
 
     auto PelvisTransformCS = SolvePelvis(Context);
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("DeltaTime"), Context.UpdateDeltaTime);
+        RecordDiagnostic(Context, TEXT("FirstUpdate"), bIsFirstUpdate);
+        RecordDiagnostic(Context, TEXT("Alpha"), ActualAlpha);
+        RecordDiagnostic(Context, TEXT("ComponentLocationWS"), Context.OwningComponentToWorld.GetLocation());
+        RecordDiagnostic(Context, TEXT("WorldUnitsPerComponentUnit"), Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("TraceStartOffsetWS"), TraceSettings.StartOffset * Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("TraceEndOffsetWS"), TraceSettings.EndOffset * Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("PelvisInterpolationEnabled"), PelvisSettings.bEnableInterpolation);
+        RecordDiagnostic(Context, TEXT("PelvisStiffness"), PelvisSettings.LinearStiffness);
+        RecordDiagnostic(Context, TEXT("PelvisDamping"), PelvisSettings.LinearDamping);
+        RecordDiagnostic(Context, TEXT("PelvisInputWS"), Context.OwningComponentToWorld.TransformPosition(PelvisData.InputPose.FKTransformCS.GetLocation()));
+        RecordDiagnostic(Context, TEXT("PelvisSolvedWS"), Context.OwningComponentToWorld.TransformPosition(PelvisTransformCS.GetLocation()));
+        RecordDiagnostic(Context, TEXT("PelvisSolvedOffsetWS"), Context.OwningComponentToWorld.TransformVector(
+            PelvisTransformCS.GetLocation() - PelvisData.InputPose.FKTransformCS.GetLocation()));
+        RecordDiagnostic(Context, TEXT("PelvisMaxOffsetClampEnabled"), PelvisSettings.bEnableInterpolation);
+    }
+#endif
     if (PelvisSettings.bEnableInterpolation)
     {
         const auto& RootCS = GetRootToComponent();
         PelvisTransformCS = UpdatePelvisInterpolationRootSpace(Context,
             PelvisTransformCS.GetRelativeTransform(RootCS)) * RootCS;
     }
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisPostInterpolationWS"), Context.OwningComponentToWorld.TransformPosition(PelvisTransformCS.GetLocation()));
+    }
+#endif
     PelvisData.DisablePelvis = FMath::Clamp(Output.Curve.Get(PelvisSettings.DisablePelvisCurveName), 0.0f, 1.0f);
     PelvisTransformCS.BlendWith(PelvisData.InputPose.FKTransformCS, PelvisData.DisablePelvis);
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("DisablePelvisAlpha"), PelvisData.DisablePelvis);
+        RecordDiagnostic(Context, TEXT("PelvisNodeOutputWS"), Context.OwningComponentToWorld.TransformPosition(PelvisTransformCS.GetLocation()));
+    }
+#endif
     OutBoneTransforms.Add(FBoneTransform(PelvisData.Bones.FkBoneIndex, PelvisTransformCS));
 
     if (InterpolationSettings.bSmoothRootBone && PelvisData.Bones.FkBoneIndex.GetInt() != 0)
@@ -1091,11 +1284,19 @@ void FAnimNode_PawniardFootPlacement::EvaluateSkeletalControl_AnyThread(
     }
     if (OutBoneTransforms.ContainsByPredicate([](const auto& Bone) { return Bone.Transform.ContainsNaN(); }))
     {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+        RecordDiagnostic(Context, TEXT("OutputRejected"), true);
+        UE::Anim::PawniardFootPlacement::FlushDiagnostics(Context, this);
+#endif
         OutBoneTransforms.Reset();
         ResetRuntimeData();
         return;
     }
     OutBoneTransforms.Sort(FCompareBoneTransformIndex());
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    RecordDiagnostic(Context, TEXT("OutputRejected"), false);
+    UE::Anim::PawniardFootPlacement::FlushDiagnostics(Context, this);
+#endif
     bIsFirstUpdate = false;
 }
 
@@ -1252,6 +1453,9 @@ void FAnimNode_PawniardFootPlacement::CalculateFootMidpoint(const UE::Anim::Pawn
 
 void FAnimNode_PawniardFootPlacement::ProcessComponentState(const UE::Anim::PawniardFootPlacement::FEvaluationContext& Context)
 {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    using UE::Anim::PawniardFootPlacement::RecordDiagnostic;
+#endif
     const auto LastComponentLocationWS = bIsFirstUpdate
         ? Context.OwningComponentToWorld.GetLocation()
         : CharacterData.ComponentTransformWS.GetLocation();
@@ -1335,6 +1539,7 @@ void FAnimNode_PawniardFootPlacement::ProcessComponentState(const UE::Anim::Pawn
         CharacterData.ComponentMoveDeltaWS += ComponentMoveOffsetWS;
     }
 
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
     TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("Grounded"), CharacterData.bIsOnGround);
     TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("WasGrounded"), bWasOnGround);
     TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("CompensationEnabled"),
@@ -1344,6 +1549,19 @@ void FAnimNode_PawniardFootPlacement::ProcessComponentState(const UE::Anim::Pawn
     TRACE_ANIM_NODE_VALUE(Context.CSPContext, TEXT("CompensationUpWS"),
         static_cast<float>(FVector::DotProduct(
             CharacterData.ComponentMoveDeltaWS - (ComponentLocationWS - LastComponentLocationWS), -Context.ApproachDirWS)));
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("Grounded"), CharacterData.bIsOnGround);
+        RecordDiagnostic(Context, TEXT("WasGrounded"), bWasOnGround);
+        RecordDiagnostic(Context, TEXT("CompensationEnabled"),
+            bOnGround && PelvisSettings.ActorMovementCompensationMode != EActorMovementCompensationMode::ComponentSpace);
+        RecordDiagnostic(Context, TEXT("ComponentDeltaUpWS"), (ComponentLocationWS - LastComponentLocationWS).Dot(-Context.ApproachDirWS));
+        RecordDiagnostic(Context, TEXT("CompensationUpWS"),
+            (CharacterData.ComponentMoveDeltaWS - (ComponentLocationWS - LastComponentLocationWS)).Dot(-Context.ApproachDirWS));
+        RecordDiagnostic(Context, TEXT("ReferenceGroundNormalWS"), Context.GroundNormal);
+        RecordDiagnostic(Context, TEXT("SmoothedReferenceGroundNormalWS"), CharacterData.SmoothCapsuleGroundNormalWS);
+    }
+#endif
 }
 
 void FAnimNode_PawniardFootPlacement::ProcessFootAlignment(
@@ -1575,6 +1793,9 @@ const FTransform& FAnimNode_PawniardFootPlacement::GetRootToComponent() const
 FTransform FAnimNode_PawniardFootPlacement::SolvePelvis(const UE::Anim::PawniardFootPlacement::FEvaluationContext& Context)
 {
     using namespace UE::Anim::FootPlacement;
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    using UE::Anim::PawniardFootPlacement::RecordDiagnostic;
+#endif
 
     // Rebalance the pelvis before calculating its desired height
     FTransform RebalancedPelvisTransform  = PelvisData.InputPose.FKTransformCS;
@@ -1617,6 +1838,17 @@ FTransform FAnimNode_PawniardFootPlacement::SolvePelvis(const UE::Anim::Pawniard
         const float MaxOffset = PelvisOffsetRangeCS.MaxExtension;
         const float MinOffset = PelvisOffsetRangeCS.MinExtension;
 
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+        if (Context.bCaptureDiagnostics)
+        {
+            RecordDiagnostic(Context, TEXT("PelvisDesiredUpWS"), DesiredOffset * Context.WorldUnitsPerComponentUnit, LegData.Idx);
+            RecordDiagnostic(Context, TEXT("PelvisMinUpWS"), MinOffset * Context.WorldUnitsPerComponentUnit, LegData.Idx);
+            RecordDiagnostic(Context, TEXT("PelvisMaxUpWS"), MaxOffset * Context.WorldUnitsPerComponentUnit, LegData.Idx);
+            RecordDiagnostic(Context, TEXT("InputFootWS"), Context.OwningComponentToWorld.TransformPosition(LegData.InputPose.FootTransformCS.GetLocation()), LegData.Idx);
+            RecordDiagnostic(Context, TEXT("AlignedFootWS"), LegData.AlignedFootTransformWS.GetLocation(), LegData.Idx);
+        }
+#endif
+
         DesiredOffsetAvg += DesiredOffset / FootNum;
         DesiredOffsetMin = FMath::Min(DesiredOffsetMin, DesiredOffset);
         MaxOffsetMin = FMath::Min(MaxOffsetMin, MaxOffset);
@@ -1634,8 +1866,24 @@ FTransform FAnimNode_PawniardFootPlacement::SolvePelvis(const UE::Anim::Pawniard
         DesiredOffsetMin :
         DesiredOffsetMin + ((MinToAvg * MinToMax) / Divisor);
 
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisUnconstrainedUpWS"), PelvisOffsetZ * Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("PelvisConstraintMinUpWS"), MinOffsetMax * Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("PelvisConstraintMaxUpWS"), MaxOffsetMin * Context.WorldUnitsPerComponentUnit);
+        RecordDiagnostic(Context, TEXT("PelvisConstraintConflict"), MinOffsetMax > MaxOffsetMin);
+    }
+#endif
+
     // Adjust the hips to prevent over-compression
     PelvisOffsetZ = FMath::Clamp(PelvisOffsetZ, FMath::Min(MinOffsetMax, MaxOffsetMin), MaxOffsetMin);
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisConstrainedUpWS"), PelvisOffsetZ * Context.WorldUnitsPerComponentUnit);
+    }
+#endif
     PelvisOffsetDelta += -PelvisOffsetZ * Context.ApproachDirCS;
 
     FTransform PelvisTransformCS = PelvisData.InputPose.FKTransformCS;
@@ -1648,6 +1896,9 @@ FTransform FAnimNode_PawniardFootPlacement::UpdatePelvisInterpolationRootSpace(
     const UE::Anim::PawniardFootPlacement::FEvaluationContext& Context,
     const FTransform& TargetPelvisTransformRS)
 {
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    using UE::Anim::PawniardFootPlacement::RecordDiagnostic;
+#endif
     const auto& RootTransformCS = GetRootToComponent();
     const auto PelvisLocationRS = RootTransformCS.InverseTransformPosition(PelvisData.InputPose.FKTransformCS.GetLocation());
 
@@ -1655,6 +1906,19 @@ FTransform FAnimNode_PawniardFootPlacement::UpdatePelvisInterpolationRootSpace(
     // Calculate the offset from input pose and interpolate
     FVector DesiredPelvisOffset =
         TargetPelvisTransformRS.GetLocation() - PelvisLocationRS;
+
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    const auto OffsetToWorld = [&](const FVector& OffsetRS)
+    {
+        return Context.OwningComponentToWorld.TransformVector(RootTransformCS.TransformVector(OffsetRS));
+    };
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisTargetRawOffsetWS"), OffsetToWorld(DesiredPelvisOffset));
+        RecordDiagnostic(Context, TEXT("PelvisSpringBeforeOffsetWS"), OffsetToWorld(PelvisData.Interpolation.PelvisTranslationOffset));
+        RecordDiagnostic(Context, TEXT("PelvisMaxOffsetClamped"), DesiredPelvisOffset.SizeSquared() > PelvisData.MaxOffsetSqrd);
+    }
+#endif
 
     // Clamp by MaxOffset
     // Clamping the target before interpolation means we may exceed this purely do to interpolation.
@@ -1665,6 +1929,12 @@ FTransform FAnimNode_PawniardFootPlacement::UpdatePelvisInterpolationRootSpace(
     {
         DesiredPelvisOffset = DesiredPelvisOffset.GetClampedToMaxSize(MaxOffset);
     }
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisTargetClampedOffsetWS"), OffsetToWorld(DesiredPelvisOffset));
+    }
+#endif
 
     // Spring interpolation may cause hyperextension/compression so we solve that in FinalizeFootAlignment
     const auto NewTranslationOffset = UKismetMathLibrary::VectorSpringInterp(
@@ -1673,9 +1943,17 @@ FTransform FAnimNode_PawniardFootPlacement::UpdatePelvisInterpolationRootSpace(
         PelvisSettings.LinearDamping,
         Context.UpdateDeltaTime, 1.0f, 0.0f);
     PelvisData.Interpolation.PelvisTranslationOffset = NewTranslationOffset;
+#if PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
+    if (Context.bCaptureDiagnostics)
+    {
+        RecordDiagnostic(Context, TEXT("PelvisSpringAfterOffsetWS"), OffsetToWorld(NewTranslationOffset));
+    }
+#endif
 
     OutPelvisTransform.SetLocation(
         PelvisLocationRS + PelvisData.Interpolation.PelvisTranslationOffset);
 
     return OutPelvisTransform;
 }
+
+#undef PAWNIARD_FOOT_PLACEMENT_DIAGNOSTICS
